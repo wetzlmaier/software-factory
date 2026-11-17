@@ -13,9 +13,10 @@ while [ $# -gt 0 ]; do
 done
 : "${REPO:?}" "${ISSUE:?}"
 
+WORKDIR="${FACTORY_WORK:-/work}"
 SLUG=$(echo "$NAME" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-//;s/-$//')
-mkdir -p /work/screenshots
-FILE="/work/screenshots/$SLUG.png"
+mkdir -p "$WORKDIR/screenshots"
+FILE="$WORKDIR/screenshots/$SLUG.png"
 
 node -e '
 const { chromium } = require("playwright");
@@ -37,9 +38,10 @@ if ! gh api "repos/$REPO/branches/$ASSET_BRANCH" >/dev/null 2>&1; then
   gh api "repos/$REPO/git/refs" -f ref="refs/heads/$ASSET_BRANCH" -f sha="$BASE_SHA" >/dev/null
 fi
 REMOTE_PATH="screenshots/issue-$ISSUE/$(date +%s)-$SLUG.png"
-base64 -w0 "$FILE" > /tmp/shot.b64
-jq -n --arg msg "Screenshot für #$ISSUE: $CAPTION" --arg branch "$ASSET_BRANCH" --rawfile content /tmp/shot.b64 \
+base64 -w0 "$FILE" > "$WORKDIR/shot.b64"
+jq -n --arg msg "Screenshot für #$ISSUE: $CAPTION" --arg branch "$ASSET_BRANCH" --rawfile content "$WORKDIR/shot.b64" \
   '{message:$msg, branch:$branch, content:$content}' \
   | gh api -X PUT "repos/$REPO/contents/$REMOTE_PATH" --input - >/dev/null
+rm -f "$WORKDIR/shot.b64"
 
 echo "![${CAPTION}](https://github.com/$REPO/blob/$ASSET_BRANCH/$REMOTE_PATH?raw=true)"

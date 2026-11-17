@@ -1,10 +1,10 @@
 // Software Factory – Runner
-// Läuft dauerhaft auf dem Server. Holt GitHub Issues mit dem Label "factory",
-// startet pro Issue einen Docker-Container mit Claude Code und hält Labels und Board aktuell.
-// Er schreibt selbst nie Code. Das macht der Agent im Container.
+// Läuft dauerhaft auf dem Server oder lokal. Holt GitHub Issues mit dem Label "factory",
+// startet pro Issue einen isolierten Agent-Lauf (lokal via Antigravity CLI `agy` oder in Docker)
+// und hält Labels und Board aktuell. Er schreibt selbst nie Code. Das macht der Agent.
 
 import {
-  appendFileSync, closeSync, constants, existsSync, fchownSync, fstatSync, mkdirSync, openSync, readFileSync, readSync,
+  appendFileSync, closeSync, constants, existsSync, fchownSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync,
   rmSync, statSync, writeFileSync, writeSync, chownSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -12,6 +12,8 @@ import { join } from "node:path";
 export type Config = {
   repos: string[];
   label: string;
+  /** Ausführungsart: "local" (Standard, direkt über lokalen agy-Login ohne API-Key) oder "docker" */
+  runtime?: "local" | "docker";
   /** Wie viele Agent-Läufe gleichzeitig, über alle Phasen und Repos (Prüfung, Bau, Abnahme, Verbesserung) */
   maxParallel: number;
   model: string;
@@ -70,10 +72,13 @@ function log(event: string, data: Record<string, unknown> = {}) {
   console.log(JSON.stringify({ t: new Date().toISOString(), event, ...data }));
 }
 
+const FACTORY_ROOT = join(import.meta.dirname, "..");
+const isLocalRuntime = (cfg: Config) => (cfg.runtime ?? "local") === "local";
+
 export function loadConfig(path = CONFIG_PATH): Config {
   const c = JSON.parse(readFileSync(path, "utf8"));
   return {
-    label: "factory", maxParallel: 2, model: "opus", workflow: "starter-kit", pollSeconds: 60,
+    label: "factory", runtime: "local", maxParallel: 2, model: "inherit", workflow: "starter-kit", pollSeconds: 60,
     jobTimeoutMinutes: 90, image: "software-factory-job:latest", dataDir: "/var/lib/software-factory",
     containerMemory: "3g", maxReworks: 2, ...c,
   };
@@ -122,11 +127,18 @@ export function readJobFile(path: string, maxBytes = 1_000_000): string | null {
   } finally { closeSync(fd); }
 }
 
+function safeChown(path: string, uid: number, gid = uid) {
+  try { chownSync(path, uid, gid); } catch {}
+}
+
 /** Legt eine Datei neu an (ein vorhandener Link wird entfernt, nicht verfolgt) und übergibt sie dem Container-Nutzer. */
 export function writeJobFile(path: string, content: string, uid = CONTAINER_UID, gid = uid) {
   rmSync(path, { force: true });
   const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
-  try { writeSync(fd, content); fchownSync(fd, uid, gid); } finally { closeSync(fd); }
+  try {
+    writeSync(fd, content);
+    try { fchownSync(fd, uid, gid); } catch {}
+  } finally { closeSync(fd); }
 }
 
 const readJobJson = (path: string, maxBytes = 200_000): any => {
@@ -137,8 +149,9 @@ const readJobJson = (path: string, maxBytes = 200_000): any => {
 export function redact(text: string): string {
   return text
     .replace(/sk-ant-[A-Za-z0-9_-]+/g, "[Zugangsdaten entfernt]")
+    .replace(/\bAIza[0-9A-Za-z_-]{35}\b/g, "[Zugangsdaten entfernt]")
     .replace(/\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[Zugangsdaten entfernt]")
-    .replace(/(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|GH_TOKEN|GITHUB_TOKEN)=\S+/g, "$1=[entfernt]");
+    .replace(/(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|GEMINI_API_KEY|GOOGLE_API_KEY|GH_TOKEN|GITHUB_TOKEN)=\S+/g, "$1=[entfernt]");
 }
 
 // ---------- Dauerhafter Zustand pro Issue (nur für den Runner) ----------
@@ -281,7 +294,49 @@ const jobDir = (cfg: Config, repo: string, n: number) => join(cfg.dataDir, "jobs
 const scenarioDir = (cfg: Config, repo: string, n: number) => join(cfg.dataDir, "scenarios", `${repo.replace("/", "__")}__${n}`);
 const agentLimits = (cfg: Config) => ["--memory", cfg.containerMemory, "--memory-swap", cfg.containerMemory, "--pids-limit", "4096", "--shm-size", "1g"];
 
-async function listContainers(): Promise<Container[]> {
+const procFile = (dir: string) => join(dir, "proc.json");
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; }
+}
+
+function stopLocalPid(pid?: number, force = false) {
+  if (!pid || !isPidAlive(pid)) return;
+  try { process.kill(pid, force ? "SIGKILL" : "SIGTERM"); } catch {}
+}
+
+async function listContainers(cfg: Config): Promise<Container[]> {
+  if (isLocalRuntime(cfg)) {
+    const jobsRoot = join(cfg.dataDir, "jobs");
+    if (!existsSync(jobsRoot)) return [];
+    const result: Container[] = [];
+    for (const entry of readdirSync(jobsRoot)) {
+      const p = readJobJson(procFile(join(jobsRoot, entry)));
+      if (!p || !p.repo || !p.issue) continue;
+      let running = Boolean(p.running);
+      let finishedAt = String(p.finishedAt ?? "");
+      let exitCode = typeof p.exitCode === "number" ? p.exitCode : 0;
+      if (running && !isPidAlive(Number(p.pid))) {
+        running = false;
+        finishedAt = finishedAt || new Date().toISOString();
+        if (typeof p.exitCode !== "number") exitCode = 1;
+      }
+      result.push({
+        name: String(p.name ?? entry),
+        repo: String(p.repo),
+        issue: Number(p.issue),
+        phase: (p.phase ?? "build") as Phase,
+        mode: String(p.mode ?? "new"),
+        running,
+        startedAt: String(p.startedAt ?? new Date().toISOString()),
+        finishedAt,
+        exitCode,
+      });
+    }
+    return result;
+  }
+
   const names = (await docker(["ps", "-a", "--filter", "label=software-factory=1", "--format", "{{.Names}}"])).split("\n").filter(Boolean);
   const result: Container[] = [];
   for (const name of names) {
@@ -352,8 +407,10 @@ async function launch(cfg: Config, repo: string, issue: Issue, phase: Phase, mod
   const name = containerName(repo, issue.number);
   const dir = jobDir(cfg, repo, issue.number);
   mkdirSync(dir, { recursive: true });
-  chownSync(dir, CONTAINER_UID, CONTAINER_UID);
-  for (const f of ["status.json", "verify.json", "verify.md"]) rmSync(join(dir, f), { force: true });
+  safeChown(dir, CONTAINER_UID, CONTAINER_UID);
+  for (const f of ["status.json", "verify.json", "verify.md", "agy.jsonl", "agy.err", "claude.jsonl", "claude.err", "proc.json", "entrypoint.log"]) {
+    rmSync(join(dir, f), { force: true });
+  }
   writeJobFile(join(dir, "prompt.md"), buildPrompt(cfg, repo, issue, phase, mode, prUrl, extra));
 
   if (phase === "check" && !issue.comments.some((c) => isFactoryComment(c) && c.body.includes(`${MARK}claimed`))) {
@@ -364,13 +421,52 @@ async function launch(cfg: Config, repo: string, issue: Issue, phase: Phase, mod
   // Testszenarien liegen außerhalb des Repos: Prüfung schreibt sie, Abnahme liest sie, der Bau sieht sie nie
   const scen = scenarioDir(cfg, repo, issue.number);
   mkdirSync(scen, { recursive: true });
-  chownSync(scen, CONTAINER_UID, CONTAINER_UID);
-  const scenarioMount = phase === "check" ? ["-v", `${scen}:/scenarios`] : phase === "accept" ? ["-v", `${scen}:/scenarios:ro`] : [];
+  safeChown(scen, CONTAINER_UID, CONTAINER_UID);
   await setStage(repo, issue, status);
   await syncBoard(cfg, issue.url, status);
 
   const ghToken = (await gh(["auth", "token"])).trim();
-  const authVar = process.env.CLAUDE_CODE_OAUTH_TOKEN ? "CLAUDE_CODE_OAUTH_TOKEN" : "ANTHROPIC_API_KEY";
+  if (isLocalRuntime(cfg)) {
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      REPO: repo,
+      ISSUE: String(issue.number),
+      BRANCH: `factory/${issue.number}`,
+      MODEL: cfg.model,
+      WORKFLOW: cfg.workflow,
+      PHASE: phase,
+      FACTORY_WORK: dir,
+      FACTORY_ROOT,
+      GH_TOKEN: ghToken,
+    };
+    if (phase === "check" || phase === "accept") env.SCENARIOS_DIR = scen;
+    else delete env.SCENARIOS_DIR;
+
+    const entrypoint = join(FACTORY_ROOT, "image", "entrypoint.sh");
+    const proc = Bun.spawn(["bash", "-c", 'exec bash "$1" > "$FACTORY_WORK/entrypoint.log" 2>&1', "_", entrypoint], {
+      stdin: "ignore", stdout: "ignore", stderr: "ignore", env,
+    });
+    const meta = {
+      name, repo, issue: issue.number, phase, mode,
+      pid: proc.pid, startedAt: new Date().toISOString(),
+      running: true, finishedAt: "", exitCode: 0,
+    };
+    writeFileSync(procFile(dir), JSON.stringify(meta, null, 2));
+    proc.exited.then((code) => {
+      if (existsSync(procFile(dir))) {
+        writeFileSync(procFile(dir), JSON.stringify({
+          ...meta, running: false, finishedAt: new Date().toISOString(), exitCode: code,
+        }, null, 2));
+      }
+    }).catch(() => {});
+    log("job:started", { repo, issue: issue.number, phase, mode, runtime: "local", pid: proc.pid });
+    return;
+  }
+
+  const scenarioMount = phase === "check" ? ["-v", `${scen}:/scenarios`] : phase === "accept" ? ["-v", `${scen}:/scenarios:ro`] : [];
+  const authEnvArgs = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"]
+    .filter((k) => Boolean(process.env[k]))
+    .flatMap((k) => ["-e", k]);
   await docker(["rm", "-f", name]).catch(() => {});
   await docker([
     "run", "-d", "--name", name,
@@ -378,11 +474,11 @@ async function launch(cfg: Config, repo: string, issue: Issue, phase: Phase, mod
     ...agentLimits(cfg),
     "-e", `REPO=${repo}`, "-e", `ISSUE=${issue.number}`, "-e", `BRANCH=factory/${issue.number}`,
     "-e", `MODEL=${cfg.model}`, "-e", `WORKFLOW=${cfg.workflow}`, "-e", `PHASE=${phase}`,
-    "-e", "GH_TOKEN", "-e", authVar, // Werte kommen aus der Umgebung, nicht aus der Kommandozeile
+    "-e", "GH_TOKEN", ...authEnvArgs, // Werte kommen aus der Umgebung, nicht aus der Kommandozeile
     "-v", `${dir}:/work`, ...scenarioMount,
     await imageFor(cfg, repo),
   ], { GH_TOKEN: ghToken });
-  log("job:started", { repo, issue: issue.number, phase, mode, container: name });
+  log("job:started", { repo, issue: issue.number, phase, mode, runtime: "docker", container: name });
 }
 
 /** Nach einem Bau-Lauf: Sind die Pflicht-Checks auf genau dem gepushten Stand grün und ist die Spec unverändert? */
@@ -405,12 +501,12 @@ async function checkBuild(repo: string, issue: number, dir: string, prUrl?: stri
   return null;
 }
 
-/** Wertet einen beendeten Container aus und räumt ihn weg. `reason` = Grund, warum der Runner ihn beendet hat. */
+/** Wertet einen beendeten Job/Container aus und räumt ihn weg. `reason` = Grund, warum der Runner ihn beendet hat. */
 async function finish(cfg: Config, c: Container, reason?: string) {
   const dir = jobDir(cfg, c.repo, c.issue);
   const status: { status?: string; step?: string; pr?: string; unresolved?: boolean } = readJobJson(join(dir, "status.json")) ?? {};
   let result: any = {};
-  const tail = readJobFile(join(dir, "claude.jsonl"), 500_000) ?? "";
+  const tail = readJobFile(join(dir, "agy.jsonl"), 500_000) ?? readJobFile(join(dir, "claude.jsonl"), 500_000) ?? "";
   try { result = JSON.parse(tail.trim().split("\n").pop() ?? ""); } catch {}
 
   const endStates: Record<Phase, string[]> = {
@@ -420,7 +516,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
   };
   let problem = reason ?? null;
   if (!problem && !(status.status && endStates[c.phase].includes(status.status))) problem = "Der Lauf hat kein Ergebnis gemeldet.";
-  if (!problem && (c.exitCode !== 0 || result.is_error)) problem = `Claude Code wurde mit einem Fehler beendet (Exit-Code ${c.exitCode}).`;
+  if (!problem && (c.exitCode !== 0 || result.is_error)) problem = `Der Agent wurde mit einem Fehler beendet (Exit-Code ${c.exitCode}).`;
   if (!problem && c.phase === "build" && status.status === "accepting") problem = await checkBuild(c.repo, c.issue, dir, status.pr);
   const ended = !problem;
   const metricStatus = ended ? (status.status === "review" && status.unresolved ? "unresolved" : status.status) : "failed";
@@ -430,7 +526,8 @@ async function finish(cfg: Config, c: Container, reason?: string) {
     minutes: result.duration_ms ? Math.round(result.duration_ms / 60000) : null,
     turns: result.num_turns ?? null, costUsd: result.total_cost_usd ?? null,
   });
-  const errTail = redact(readJobFile(join(dir, "claude.err"), 1500) ?? "");
+  const errTail = redact(readJobFile(join(dir, "agy.err"), 1500) ?? readJobFile(join(dir, "claude.err"), 1500) ?? "");
+  const resultText = typeof result.result === "string" ? result.result : typeof result.text === "string" ? result.text : typeof result.content === "string" ? result.content : "";
   // Kurze Zusammenfassung des Laufs dauerhaft festhalten: Grundlage für den Verbesserungs-Lauf
   try {
     const runsDir = join(cfg.dataDir, "runs");
@@ -438,7 +535,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
     writeFileSync(join(runsDir, `${new Date().toISOString().replace(/[:.]/g, "-")}__${c.repo.replace("/", "__")}__${c.issue}__${c.phase}.json`), JSON.stringify({
       repo: c.repo, issue: c.issue, phase: c.phase, mode: c.mode, exitCode: c.exitCode,
       status: metricStatus, problem, reported: status,
-      result: typeof result.result === "string" ? redact(result.result.slice(0, 4000)) : null,
+      result: resultText ? redact(resultText.slice(0, 4000)) : null,
       turns: result.num_turns ?? null, costUsd: result.total_cost_usd ?? null, errTail,
     }, null, 2));
   } catch (e) { log("runs:error", { error: String(e) }); }
@@ -453,7 +550,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
   if (ended) {
     setState(cfg, c.repo, c.issue, {});
   } else {
-    let detail = typeof result.result === "string" ? result.result.slice(-1500) : "";
+    let detail = resultText ? resultText.slice(-1500) : "";
     if (!detail) detail = errTail.slice(-800);
     detail = redact(detail).replace(/```/g, "'''").trim();
     const issue = JSON.parse(await gh(["issue", "view", String(c.issue), "-R", c.repo, "--json", "number,title,body,url,labels,comments"]));
@@ -464,7 +561,11 @@ async function finish(cfg: Config, c: Container, reason?: string) {
       (detail ? "Letzte Ausgabe:\n```\n" + detail + "\n```\n\n" : "") +
       `_Schreib einen Kommentar mit einem Hinweis, dann versucht die Factory es erneut._`);
   }
-  await docker(["rm", "-f", c.name]).catch(() => {});
+  if (isLocalRuntime(cfg)) {
+    rmSync(procFile(dir), { force: true });
+  } else {
+    await docker(["rm", "-f", c.name]).catch(() => {});
+  }
 }
 
 // ---------- Vorschau pro Pull Request (optional) ----------
@@ -558,7 +659,7 @@ async function syncPreviews(cfg: Config, repo: string, issues: Issue[]) {
     const src = previewDir(cfg, name);
     rmSync(src, { recursive: true, force: true });
     mkdirSync(src, { recursive: true });
-    chownSync(src, CONTAINER_UID, CONTAINER_UID);
+    safeChown(src, CONTAINER_UID, CONTAINER_UID);
     const ghToken = (await gh(["auth", "token"])).trim();
     await docker(["run", "--rm", "-e", `REPO=${repo}`, "-e", `BRANCH=factory/${issueNr}`, "-e", "GH_TOKEN",
       "-v", `${src}:/src`, "--entrypoint", "bash", image, "-c",
@@ -594,6 +695,22 @@ async function syncPreviews(cfg: Config, repo: string, issues: Issue[]) {
 // Belegt einen Agent-Platz wie jeder andere Lauf.
 
 async function improveRunning(cfg: Config): Promise<boolean> {
+  if (isLocalRuntime(cfg)) {
+    const metaPath = join(cfg.dataDir, "improve-proc.json");
+    if (!existsSync(metaPath)) return false;
+    const p = readJobJson(metaPath);
+    if (!p) { rmSync(metaPath, { force: true }); return false; }
+    if (p.running && isPidAlive(Number(p.pid))) {
+      if ((Date.now() - Date.parse(p.startedAt)) / 60000 <= cfg.jobTimeoutMinutes) return true;
+      log("improve:timeout", { pid: p.pid });
+      stopLocalPid(Number(p.pid), true);
+    }
+    const out = readJobFile(join(cfg.dataDir, "improve-work", "improve.log"), 1500) ?? "";
+    log("improve:finished", { tail: redact(out.trim().slice(-600)) });
+    rmSync(metaPath, { force: true });
+    return false;
+  }
+
   const lines = (await docker(["ps", "-a", "--filter", "label=sf.improve=1", "--format", "{{.Names}}|{{.State}}|{{.RunningFor}}"])).trim().split("\n").filter(Boolean);
   let running = false;
   for (const line of lines) {
@@ -627,15 +744,38 @@ async function maybeImprove(cfg: Config, freeSlots: number) {
   const metrics = join(cfg.dataDir, "metrics.jsonl");
   mkdirSync(work, { recursive: true }); mkdirSync(runs, { recursive: true });
   if (!existsSync(metrics)) writeFileSync(metrics, "");
-  chownSync(work, CONTAINER_UID, CONTAINER_UID);
+  safeChown(work, CONTAINER_UID, CONTAINER_UID);
   const ghToken = (await gh(["auth", "token"])).trim();
-  const authVar = process.env.CLAUDE_CODE_OAUTH_TOKEN ? "CLAUDE_CODE_OAUTH_TOKEN" : "ANTHROPIC_API_KEY";
+
+  if (isLocalRuntime(cfg)) {
+    const metaPath = join(cfg.dataDir, "improve-proc.json");
+    const improveScript = join(FACTORY_ROOT, "image", "improve.sh");
+    const proc = Bun.spawn(["bash", "-c", 'exec bash "$1" > "$FACTORY_WORK/improve.log" 2>&1', "_", improveScript], {
+      stdin: "ignore", stdout: "ignore", stderr: "ignore",
+      env: {
+        ...(process.env as Record<string, string>),
+        REPO: cfg.factoryRepo, MODEL: cfg.model, GH_TOKEN: ghToken,
+        FACTORY_WORK: work, FACTORY_ROOT, FACTORY_DATA: cfg.dataDir,
+      },
+    });
+    const meta = { pid: proc.pid, startedAt: new Date().toISOString(), running: true, exitCode: 0 };
+    writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+    proc.exited.then((code) => {
+      if (existsSync(metaPath)) writeFileSync(metaPath, JSON.stringify({ ...meta, running: false, exitCode: code }, null, 2));
+    }).catch(() => {});
+    log("improve:started", { repo: cfg.factoryRepo, runtime: "local", pid: proc.pid });
+    return;
+  }
+
+  const authEnvArgs = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"]
+    .filter((k) => Boolean(process.env[k]))
+    .flatMap((k) => ["-e", k]);
   await docker(["run", "-d", "--name", "sf-improve", "--label", "sf.improve=1",
     ...agentLimits(cfg),
-    "-e", `REPO=${cfg.factoryRepo}`, "-e", `MODEL=${cfg.model}`, "-e", "GH_TOKEN", "-e", authVar,
+    "-e", `REPO=${cfg.factoryRepo}`, "-e", `MODEL=${cfg.model}`, "-e", "GH_TOKEN", ...authEnvArgs,
     "-v", `${work}:/work`, "-v", `${runs}:/data/runs:ro`, "-v", `${metrics}:/data/metrics.jsonl:ro`,
     "--entrypoint", "/factory/improve.sh", cfg.image], { GH_TOKEN: ghToken });
-  log("improve:started", { repo: cfg.factoryRepo });
+  log("improve:started", { repo: cfg.factoryRepo, runtime: "docker" });
 }
 
 // ---------- Hauptschleife ----------
@@ -661,8 +801,14 @@ async function tickRepo(cfg: Config, repo: string, containers: Container[], slot
   // Label entfernt oder Issue geschlossen → laufenden Job stoppen und als beendet erfassen
   for (const c of containers.filter((c) => c.repo === repo && !openNumbers.has(c.issue))) {
     log("job:stopped", { repo, issue: c.issue, reason: "Label entfernt oder Issue geschlossen" });
-    await docker(["kill", c.name]).catch(() => {});
-    await docker(["rm", "-f", c.name]).catch(() => {});
+    if (isLocalRuntime(cfg)) {
+      const p = readJobJson(procFile(jobDir(cfg, c.repo, c.issue)));
+      stopLocalPid(Number(p?.pid), true);
+      rmSync(procFile(jobDir(cfg, c.repo, c.issue)), { force: true });
+    } else {
+      await docker(["kill", c.name]).catch(() => {});
+      await docker(["rm", "-f", c.name]).catch(() => {});
+    }
     slots.free++;
   }
 
@@ -745,16 +891,21 @@ async function tickRepo(cfg: Config, repo: string, containers: Container[], slot
 }
 
 async function tick(cfg: Config) {
-  let containers = await listContainers();
+  let containers = await listContainers(cfg);
 
-  // 1. Beendete Container auswerten, zu lange laufende stoppen und als Fehlschlag erfassen
+  // 1. Beendete Container/Prozesse auswerten, zu lange laufende stoppen und als Fehlschlag erfassen
   for (const c of containers) {
     try {
       if (!c.running) { await finish(cfg, c); continue; }
       const minutes = (Date.now() - Date.parse(c.startedAt)) / 60000;
       if (minutes > cfg.jobTimeoutMinutes) {
         log("job:timeout", { repo: c.repo, issue: c.issue, minutes: Math.round(minutes) });
-        await docker(["kill", c.name]).catch(() => {});
+        if (isLocalRuntime(cfg)) {
+          const p = readJobJson(procFile(jobDir(cfg, c.repo, c.issue)));
+          stopLocalPid(Number(p?.pid), true);
+        } else {
+          await docker(["kill", c.name]).catch(() => {});
+        }
         await finish(cfg, { ...c, running: false, exitCode: 137, finishedAt: new Date().toISOString() },
           `Zeitlimit von ${cfg.jobTimeoutMinutes} Minuten überschritten.`);
       }
@@ -762,7 +913,7 @@ async function tick(cfg: Config) {
       log("finish:error", { repo: c.repo, issue: c.issue, error: String(e) });
     }
   }
-  containers = (await listContainers()).filter((c) => c.running);
+  containers = (await listContainers(cfg)).filter((c) => c.running);
   const improving = await improveRunning(cfg);
   const slots = { free: cfg.maxParallel - containers.length - (improving ? 1 : 0) };
 
@@ -778,18 +929,16 @@ async function tick(cfg: Config) {
 async function main() {
   const once = process.argv.includes("--once");
   let cfg = loadConfig();
-  if (!process.env.CLAUDE_CODE_OAUTH_TOKEN && !process.env.ANTHROPIC_API_KEY) {
-    log("config:error", { error: "Weder CLAUDE_CODE_OAUTH_TOKEN noch ANTHROPIC_API_KEY gesetzt" });
-    process.exit(1);
+  if (isLocalRuntime(cfg)) {
+    CONTAINER_UID = process.getuid ? process.getuid() : 1000;
+  } else {
+    CONTAINER_UID = Number((await docker(["run", "--rm", "--entrypoint", "id", cfg.image, "-u"])).trim());
   }
-  if (process.env.CLAUDE_CODE_OAUTH_TOKEN && process.env.ANTHROPIC_API_KEY) {
-    log("config:warning", { warning: "Beide Login-Arten gesetzt. Es wird nur CLAUDE_CODE_OAUTH_TOKEN an die Jobs gegeben." });
-  }
-  CONTAINER_UID = Number((await docker(["run", "--rm", "--entrypoint", "id", cfg.image, "-u"])).trim());
   FACTORY_LOGIN = (await gh(["api", "user", "--jq", ".login"])).trim();
   await initBoard(cfg);
   log("runner:started", {
     login: FACTORY_LOGIN, allowedUsers: cfg.allowedUsers ?? [],
+    runtime: isLocalRuntime(cfg) ? "local" : "docker",
     preview: cfg.preview ? previewLink(cfg, 1).replace(/:4001$/, ":4001…") : "aus",
     containerUid: CONTAINER_UID, repos: cfg.repos, maxParallel: cfg.maxParallel, model: cfg.model, workflow: cfg.workflow,
   });

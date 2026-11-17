@@ -3,8 +3,9 @@
     "DEIN-GITHUB-NAME/dein-repo"
   ],
   "label": "factory",
+  "runtime": "local",
   "maxParallel": 2,
-  "model": "opus",
+  "model": "inherit",
   "workflow": "starter-kit",
   "pollSeconds": 60,
   "jobTimeoutMinutes": 90,

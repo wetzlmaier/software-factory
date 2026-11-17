@@ -92,6 +92,8 @@ case "$STAGE" in
       echo "_Schreib einen Kommentar mit einem Hinweis, dann versucht sie es erneut._"; } | comment ;;
 esac
 
+WORKDIR="${FACTORY_WORK:-/work}"
+mkdir -p "$WORKDIR"
 jq -n --arg status "$STATUS" --arg step "$STEP" --arg phase "$PHASE" --arg summary "$SUMMARY" --arg question "$QUESTION" --arg pr "$PR_URL" --argjson unresolved "$UNRESOLVED" \
-  '{status:$status, step:$step, phase:$phase, summary:$summary, question:$question, pr:$pr, unresolved:$unresolved, at:(now|todate)}' > /work/status.json
+  '{status:$status, step:$step, phase:$phase, summary:$summary, question:$question, pr:$pr, unresolved:$unresolved, at:(now|todate)}' > "$WORKDIR/status.json"
 echo "Gemeldet: $STAGE"

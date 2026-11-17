@@ -1,0 +1,26 @@
+{
+  "name": "antigravity-factory",
+  "description": "Native Antigravity Software Factory pipeline: Prüfung -> Bau -> Unabhängige Abnahme (ohne API-Key)",
+  "entry": "factory_workflow.py",
+  "args": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "Feature-ID (z. B. PROJ-1), Spec-Pfad (features/.../spec.md) oder GitHub-Issue-Nummer (#12)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "Optionales GitHub-Repository (owner/name), falls mit GitHub Issues/PRs gearbeitet wird"
+      },
+      "max_reworks": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 2,
+        "description": "Maximale Anzahl an Nachbesserungsrunden zwischen Abnahme und Bau"
+      }
+    },
+    "required": ["target"],
+    "additionalProperties": false
+  }
+}
