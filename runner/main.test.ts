@@ -54,11 +54,14 @@ test("writeJobFile ersetzt einen Symlink, statt in sein Ziel zu schreiben", () =
 });
 
 test("redact entfernt Zugangsdaten aus öffentlichen Texten", () => {
-  const out = redact("x sk-ant-oat01-AbC_d-ef y ghp_0123456789abcdefghijABCDEF github_pat_11AAAAAAA0123456789_abcdefghij GH_TOKEN=geheim");
+  const out = redact("x sk-ant-oat01-AbC_d-ef y ghp_0123456789abcdefghijABCDEF github_pat_11AAAAAAA0123456789_abcdefghij GH_TOKEN=geheim GEMINI_API_KEY=geheim123 GOOGLE_API_KEY=geheim456 AIzaSyA12345678901234567890123456789012");
   assert.ok(!out.includes("sk-ant-oat01"));
   assert.ok(!out.includes("ghp_0123"));
   assert.ok(!out.includes("github_pat_11"));
   assert.ok(!out.includes("geheim"));
+  assert.ok(!out.includes("geheim123"));
+  assert.ok(!out.includes("geheim456"));
+  assert.ok(!out.includes("AIzaSyA12345678901234567890123456789012"));
 });
 
 // ---------- Wer darf der Factory Anweisungen geben? ----------
@@ -212,6 +215,13 @@ test("Zeitüberschreitung wird als Fehlschlag mit Grund erfasst", async () => {
   const r = await finishRun("build", { "status.json": '{"status":"working","step":"implementing"}' }, 137, "Zeitlimit von 90 Minuten überschritten.");
   assert.equal(r.metric.status, "failed");
   assert.ok(r.failedComment.includes("Zeitlimit"));
+});
+
+test("Bau mit grünen Checks auf dem gepushten Commit geht in die Abnahme (agy.jsonl)", async () => {
+  const verify = JSON.stringify({ sha: headSha, ok: true, results: [{ name: "lint", exit: 0 }] });
+  const r = await finishRun("build", { "status.json": '{"status":"accepting","pr":"https://x/pull/1"}', "verify.json": verify, "agy.jsonl": result() });
+  assert.equal(r.metric.status, "accepting");
+  assert.equal(r.failedComment, "");
 });
 
 test("Fehlerkommentar enthält keine Server-Dateien und keine Tokens", async () => {

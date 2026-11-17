@@ -1,5 +1,5 @@
 # Job-Image: Jeder Factory-Job läuft in einem eigenen Container aus diesem Image.
-# Enthält Claude Code, GitHub CLI, git, Node und einen Chromium für Screenshots/E2E-Tests.
+# Enthält Antigravity CLI (agy), GitHub CLI, git, Node und einen Chromium für Screenshots/E2E-Tests.
 FROM mcr.microsoft.com/playwright:v1.65.0-noble
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -26,10 +26,10 @@ COPY playbooks/improve.md /factory/improve.md
 COPY workflows/ /factory/workflows/
 RUN chmod +x /usr/local/bin/factory-* /factory/entrypoint.sh /factory/preview.sh /factory/improve.sh
 
-# Claude Code als normaler Nutzer installieren (offizieller Installer)
+# Antigravity CLI (agy) als normaler Nutzer installieren (offizieller Installer)
 USER pwuser
 ENV HOME=/home/pwuser
-RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
 # Python-Projekte: uv (verwaltet Python-Versionen und Pakete selbst)
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH=/home/pwuser/.local/bin:$PATH

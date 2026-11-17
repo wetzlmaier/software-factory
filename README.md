@@ -1,16 +1,13 @@
 # Software Factory
 
-Eine Software Factory mit Claude Code, die rund um die Uhr auf deinem eigenen Server läuft.
+Eine Software Factory mit **Antigravity CLI (`agy`)**, die rund um die Uhr auf deinem eigenen Server läuft.
 
-> 🖥️ **Server:** Die Factory läuft auf einem Linux-VPS. Getestet ist sie auf dem **Hostinger KVM 2** (2 CPU-Kerne, 8 GB RAM) mit der Vorlage „Ubuntu 24.04 mit Claude Code“.
-> Server holen: **[hostinger.com/alexclaude](https://hostinger.com/alexclaude)**. Mit dem Code **`ALEXCLAUDE`** sparst du zusätzlich 10 %.
+> 🖥️ **Server:** Die Factory läuft auf einem Linux-VPS. Getestet ist sie auf dem **Hostinger KVM 2** (2 CPU-Kerne, 8 GB RAM) mit Ubuntu 24.04.
 > Einrichtung Schritt für Schritt: **[docs/hostinger-vps-setup.md](docs/hostinger-vps-setup.md)**
->
-> _Affiliate-Link: Wenn du darüber kaufst, bekomme ich eine Provision. Für dich ändert sich am Preis nichts, mit dem Code wird es günstiger._
 
 **Du entscheidest, was gebaut wird. Die Factory baut es.**
 
-1. Du schreibst lokal mit Claude Code die Spec (`/write-spec`), prüfst sie und pushst sie.
+1. Du schreibst lokal mit Antigravity die Spec (`/write-spec`), prüfst sie und pushst sie.
 2. Du übergibst sie mit `/to-factory` an die Factory. Das legt ein GitHub Issue mit Label `factory` an, das auf die Spec zeigt.
 3. Ein Agent auf deinem Server prüft die Spec und schreibt Testszenarien. Ein zweiter Agent entwickelt: Architektur, Umsetzung, Tests, Pull Request mit Belegen (Checks, Screenshots, getroffene Annahmen). Ein dritter, unabhängiger Agent nimmt das Ergebnis mit den Testszenarien ab, die der Entwickler nie gesehen hat. Ist etwas unklar, fragt die Factory im Issue nach und macht weiter, sobald du antwortest.
 4. Du prüfst den Pull Request und mergst. **Gemergt wird immer von dir.**
@@ -31,7 +28,7 @@ Runner auf deinem Server ── prüft jede Minute die Issues
         │
         ▼
 Eigener Docker-Container pro Issue
-  └─ Claude Code + Playbook + Workflow-Skills
+  └─ Antigravity CLI (agy) + Playbook + Workflow-Skills
        Triage → Analyse → Umsetzung → Prüfung → Pull Request
         │
         ├─ unklar?  → Frage als Kommentar im Issue, wartet auf dich
@@ -42,17 +39,17 @@ Eigener Docker-Container pro Issue
 ```
 
 - **Runner** (`runner/`): kleiner Dienst auf dem Server. Holt Issues, startet Container, setzt Labels und Board-Status. Schreibt selbst keinen Code.
-- **Job-Image** (`image/`): Claude Code, GitHub CLI, git, Node und Chromium (für Tests und Screenshots).
+- **Job-Image** (`image/`): Antigravity CLI (`agy`), GitHub CLI, git, Node und Chromium (für Tests und Screenshots).
 - **Playbook** (`playbooks/factory.md`): die festen Regeln für jeden Lauf. Stages melden, bei Unklarheit fragen statt raten, Pflicht-Checks, nie selbst mergen.
 - **Workflow** (`workflows/starter-kit/`): wie entwickelt wird. Standard ist der Workflow aus dem [AI Coding Starter Kit](https://github.com/AlexPEClub/ai-coding-starter-kit): `architecture → build → qa` auf Basis deiner Spec, mit getrennten Dateien pro Feature (`spec.md`, `design.md`, `qa-report.md`). Austauschbar, siehe [workflow.md](workflows/starter-kit/workflow.md).
 - **Stack-Packs** (`workflows/starter-kit/stacks/`): Regeln für einen bestimmten Stack (z. B. `nextjs`, `supabase`). Welche gelten, steht in `docs/stack.md` des Projekts. Die Factory ist stack-unabhängig.
-- **Lokale Skills** (`local-skills/`): `init` (Projekt aufsetzen inkl. Stack), `write-spec` (Spec im Interview erarbeiten), `to-factory` (an die Factory übergeben). Einmal pro Rechner installieren: `./scripts/install-local-skills.sh`.
+- **Lokale Skills** (`local-skills/`): `init` (Projekt aufsetzen inkl. Stack), `write-spec` (Spec im Interview erarbeiten), `to-factory` (an die Factory übergeben). Einmal pro Rechner installieren: `./scripts/install-local-skills.sh` (bzw. `.\scripts\install-local-skills.ps1` unter Windows).
 - **Projekt-Vorlage**: [factory-template](https://github.com/AlexPEClub/factory-template), stack-unabhängig. Neues Projekt: `./scripts/new-project.sh mein-projekt`.
 
 ## Voraussetzungen
 
 - Ein Linux-Server mit Ubuntu 24.04, mindestens 2 vCPU und 8 GB RAM
-- Ein Claude-Abo (Pro, Max, Team oder Enterprise) **oder** ein Anthropic-API-Key
+- Ein Gemini API-Key (`GEMINI_API_KEY` aus Google AI Studio für Headless-Container) **oder** ein lokaler Antigravity-Login (`~/.gemini/antigravity-cli`)
 - Ein GitHub-Account
 
 ## Schnellstart
@@ -64,10 +61,10 @@ cd /opt/software-factory
 ```
 
 Danach:
-1. **Claude-Login:** auf deinem Rechner `claude setup-token` ausführen und den Token als `CLAUDE_CODE_OAUTH_TOKEN=...` in `/etc/software-factory/secrets.env` eintragen
+1. **Antigravity-Login:** `GEMINI_API_KEY=...` in `/etc/software-factory/secrets.env` eintragen (oder alternativ einmalig `agy` auf dem Server anmelden, sodass `~/.gemini/antigravity-cli` existiert)
 2. **GitHub-Login** auf dem Server: `gh auth login -s project`
 3. **Factory starten:** `systemctl restart software-factory`
-4. **Auf deinem Rechner:** `./scripts/install-local-skills.sh`, dann `FACTORY_SERVER=root@DEINE-IP ./scripts/new-project.sh mein-projekt`. Legt das Repo aus der Vorlage an und bindet es samt Labels und Kanban-Board an die Factory an. Ein bestehendes Repo bindest du stattdessen auf dem Server mit `./scripts/add-repo.sh dein-name/dein-repo` an.
+4. **Auf deinem Rechner:** `./scripts/install-local-skills.sh` (bzw. `.\scripts\install-local-skills.ps1`), dann `FACTORY_SERVER=root@DEINE-IP ./scripts/new-project.sh mein-projekt`. Legt das Repo aus der Vorlage an und bindet es samt Labels und Kanban-Board an die Factory an. Ein bestehendes Repo bindest du stattdessen auf dem Server mit `./scripts/add-repo.sh dein-name/dein-repo` an.
 5. Im Projekt: Briefing in `docs/briefing.md` → `/init` → pro Feature `/write-spec` → `/to-factory`
 
 Die ausführliche Schritt-für-Schritt-Anleitung (inkl. Server bei Hostinger): [docs/hostinger-vps-setup.md](docs/hostinger-vps-setup.md).

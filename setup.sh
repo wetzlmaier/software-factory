@@ -79,7 +79,7 @@ systemctl enable software-factory >/dev/null 2>&1
 
 # Was fehlt noch?
 MISSING=()
-grep -qE '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=.' "$CONF_DIR/secrets.env" || MISSING+=("Claude-Login: Token in $CONF_DIR/secrets.env (siehe Anleitung)")
+grep -qE '^(GEMINI_API_KEY|GOOGLE_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=.' "$CONF_DIR/secrets.env" || MISSING+=("Antigravity-Login: GEMINI_API_KEY=... in $CONF_DIR/secrets.env (siehe Anleitung)")
 gh auth status >/dev/null 2>&1 || MISSING+=("GitHub-Login: gh auth login -s project")
 jq -e '.repos | map(select(. != "DEIN-GITHUB-NAME/dein-repo")) | length > 0' "$CONF_DIR/config.json" >/dev/null || MISSING+=("Repo anbinden: ./scripts/add-repo.sh besitzer/repo")
 

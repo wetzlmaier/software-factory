@@ -4,7 +4,7 @@
 #   ./scripts/install-local-skills.sh
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/.." && pwd)/local-skills"
-DEST="$HOME/.claude/skills"
+DEST="$HOME/.gemini/config/skills"
 mkdir -p "$DEST"
 for skill in "$SRC"/*/; do
   name=$(basename "$skill")

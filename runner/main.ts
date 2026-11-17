@@ -1,6 +1,6 @@
 // Software Factory – Runner
 // Läuft dauerhaft auf dem Server. Holt GitHub Issues mit dem Label "factory",
-// startet pro Issue einen Docker-Container mit Claude Code und hält Labels und Board aktuell.
+// startet pro Issue einen Docker-Container mit Antigravity CLI (agy) und hält Labels und Board aktuell.
 // Er schreibt selbst nie Code. Das macht der Agent im Container.
 
 import {
@@ -73,7 +73,7 @@ function log(event: string, data: Record<string, unknown> = {}) {
 export function loadConfig(path = CONFIG_PATH): Config {
   const c = JSON.parse(readFileSync(path, "utf8"));
   return {
-    label: "factory", maxParallel: 2, model: "opus", workflow: "starter-kit", pollSeconds: 60,
+    label: "factory", maxParallel: 2, model: "inherit", workflow: "starter-kit", pollSeconds: 60,
     jobTimeoutMinutes: 90, image: "software-factory-job:latest", dataDir: "/var/lib/software-factory",
     containerMemory: "3g", maxReworks: 2, ...c,
   };
@@ -137,8 +137,9 @@ const readJobJson = (path: string, maxBytes = 200_000): any => {
 export function redact(text: string): string {
   return text
     .replace(/sk-ant-[A-Za-z0-9_-]+/g, "[Zugangsdaten entfernt]")
+    .replace(/\bAIza[0-9A-Za-z_-]{35}\b/g, "[Zugangsdaten entfernt]")
     .replace(/\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[Zugangsdaten entfernt]")
-    .replace(/(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|GH_TOKEN|GITHUB_TOKEN)=\S+/g, "$1=[entfernt]");
+    .replace(/(GEMINI_API_KEY|GOOGLE_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|GH_TOKEN|GITHUB_TOKEN)=\S+/g, "$1=[entfernt]");
 }
 
 // ---------- Dauerhafter Zustand pro Issue (nur für den Runner) ----------
@@ -348,6 +349,14 @@ async function imageFor(cfg: Config, repo: string): Promise<string> {
   return tag;
 }
 
+const AUTH_ENV_VARS = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] as const;
+function dockerAuthArgs(): string[] {
+  const envArgs = AUTH_ENV_VARS.filter((k) => Boolean(process.env[k])).flatMap((k) => ["-e", k]);
+  if (envArgs.length > 0) return envArgs;
+  const agyAuthDir = join(process.env.HOME ?? "/root", ".gemini", "antigravity-cli");
+  return existsSync(agyAuthDir) ? ["-v", `${agyAuthDir}:/home/pwuser/.gemini/antigravity-cli`] : [];
+}
+
 async function launch(cfg: Config, repo: string, issue: Issue, phase: Phase, mode: Mode, prUrl?: string, extra?: string) {
   const name = containerName(repo, issue.number);
   const dir = jobDir(cfg, repo, issue.number);
@@ -370,7 +379,6 @@ async function launch(cfg: Config, repo: string, issue: Issue, phase: Phase, mod
   await syncBoard(cfg, issue.url, status);
 
   const ghToken = (await gh(["auth", "token"])).trim();
-  const authVar = process.env.CLAUDE_CODE_OAUTH_TOKEN ? "CLAUDE_CODE_OAUTH_TOKEN" : "ANTHROPIC_API_KEY";
   await docker(["rm", "-f", name]).catch(() => {});
   await docker([
     "run", "-d", "--name", name,
@@ -378,7 +386,7 @@ async function launch(cfg: Config, repo: string, issue: Issue, phase: Phase, mod
     ...agentLimits(cfg),
     "-e", `REPO=${repo}`, "-e", `ISSUE=${issue.number}`, "-e", `BRANCH=factory/${issue.number}`,
     "-e", `MODEL=${cfg.model}`, "-e", `WORKFLOW=${cfg.workflow}`, "-e", `PHASE=${phase}`,
-    "-e", "GH_TOKEN", "-e", authVar, // Werte kommen aus der Umgebung, nicht aus der Kommandozeile
+    "-e", "GH_TOKEN", ...dockerAuthArgs(), // Werte kommen aus der Umgebung, nicht aus der Kommandozeile
     "-v", `${dir}:/work`, ...scenarioMount,
     await imageFor(cfg, repo),
   ], { GH_TOKEN: ghToken });
@@ -410,7 +418,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
   const dir = jobDir(cfg, c.repo, c.issue);
   const status: { status?: string; step?: string; pr?: string; unresolved?: boolean } = readJobJson(join(dir, "status.json")) ?? {};
   let result: any = {};
-  const tail = readJobFile(join(dir, "claude.jsonl"), 500_000) ?? "";
+  const tail = readJobFile(join(dir, "agy.jsonl"), 500_000) ?? readJobFile(join(dir, "claude.jsonl"), 500_000) ?? "";
   try { result = JSON.parse(tail.trim().split("\n").pop() ?? ""); } catch {}
 
   const endStates: Record<Phase, string[]> = {
@@ -420,7 +428,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
   };
   let problem = reason ?? null;
   if (!problem && !(status.status && endStates[c.phase].includes(status.status))) problem = "Der Lauf hat kein Ergebnis gemeldet.";
-  if (!problem && (c.exitCode !== 0 || result.is_error)) problem = `Claude Code wurde mit einem Fehler beendet (Exit-Code ${c.exitCode}).`;
+  if (!problem && (c.exitCode !== 0 || result.is_error)) problem = `Antigravity CLI wurde mit einem Fehler beendet (Exit-Code ${c.exitCode}).`;
   if (!problem && c.phase === "build" && status.status === "accepting") problem = await checkBuild(c.repo, c.issue, dir, status.pr);
   const ended = !problem;
   const metricStatus = ended ? (status.status === "review" && status.unresolved ? "unresolved" : status.status) : "failed";
@@ -430,7 +438,8 @@ async function finish(cfg: Config, c: Container, reason?: string) {
     minutes: result.duration_ms ? Math.round(result.duration_ms / 60000) : null,
     turns: result.num_turns ?? null, costUsd: result.total_cost_usd ?? null,
   });
-  const errTail = redact(readJobFile(join(dir, "claude.err"), 1500) ?? "");
+  const errTail = redact(readJobFile(join(dir, "agy.err"), 1500) ?? readJobFile(join(dir, "claude.err"), 1500) ?? "");
+  const resultText = typeof result.result === "string" ? result.result : typeof result.text === "string" ? result.text : typeof result.content === "string" ? result.content : "";
   // Kurze Zusammenfassung des Laufs dauerhaft festhalten: Grundlage für den Verbesserungs-Lauf
   try {
     const runsDir = join(cfg.dataDir, "runs");
@@ -438,7 +447,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
     writeFileSync(join(runsDir, `${new Date().toISOString().replace(/[:.]/g, "-")}__${c.repo.replace("/", "__")}__${c.issue}__${c.phase}.json`), JSON.stringify({
       repo: c.repo, issue: c.issue, phase: c.phase, mode: c.mode, exitCode: c.exitCode,
       status: metricStatus, problem, reported: status,
-      result: typeof result.result === "string" ? redact(result.result.slice(0, 4000)) : null,
+      result: resultText ? redact(resultText.slice(0, 4000)) : null,
       turns: result.num_turns ?? null, costUsd: result.total_cost_usd ?? null, errTail,
     }, null, 2));
   } catch (e) { log("runs:error", { error: String(e) }); }
@@ -453,7 +462,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
   if (ended) {
     setState(cfg, c.repo, c.issue, {});
   } else {
-    let detail = typeof result.result === "string" ? result.result.slice(-1500) : "";
+    let detail = resultText ? resultText.slice(-1500) : "";
     if (!detail) detail = errTail.slice(-800);
     detail = redact(detail).replace(/```/g, "'''").trim();
     const issue = JSON.parse(await gh(["issue", "view", String(c.issue), "-R", c.repo, "--json", "number,title,body,url,labels,comments"]));
@@ -629,10 +638,9 @@ async function maybeImprove(cfg: Config, freeSlots: number) {
   if (!existsSync(metrics)) writeFileSync(metrics, "");
   chownSync(work, CONTAINER_UID, CONTAINER_UID);
   const ghToken = (await gh(["auth", "token"])).trim();
-  const authVar = process.env.CLAUDE_CODE_OAUTH_TOKEN ? "CLAUDE_CODE_OAUTH_TOKEN" : "ANTHROPIC_API_KEY";
   await docker(["run", "-d", "--name", "sf-improve", "--label", "sf.improve=1",
     ...agentLimits(cfg),
-    "-e", `REPO=${cfg.factoryRepo}`, "-e", `MODEL=${cfg.model}`, "-e", "GH_TOKEN", "-e", authVar,
+    "-e", `REPO=${cfg.factoryRepo}`, "-e", `MODEL=${cfg.model}`, "-e", "GH_TOKEN", ...dockerAuthArgs(),
     "-v", `${work}:/work`, "-v", `${runs}:/data/runs:ro`, "-v", `${metrics}:/data/metrics.jsonl:ro`,
     "--entrypoint", "/factory/improve.sh", cfg.image], { GH_TOKEN: ghToken });
   log("improve:started", { repo: cfg.factoryRepo });
@@ -778,12 +786,11 @@ async function tick(cfg: Config) {
 async function main() {
   const once = process.argv.includes("--once");
   let cfg = loadConfig();
-  if (!process.env.CLAUDE_CODE_OAUTH_TOKEN && !process.env.ANTHROPIC_API_KEY) {
-    log("config:error", { error: "Weder CLAUDE_CODE_OAUTH_TOKEN noch ANTHROPIC_API_KEY gesetzt" });
+  const hasApiKey = AUTH_ENV_VARS.some((k) => Boolean(process.env[k]));
+  const agyAuthDir = join(process.env.HOME ?? "/root", ".gemini", "antigravity-cli");
+  if (!hasApiKey && !existsSync(agyAuthDir)) {
+    log("config:error", { error: "Kein GEMINI_API_KEY / GOOGLE_API_KEY gesetzt und kein Antigravity-Login gefunden" });
     process.exit(1);
-  }
-  if (process.env.CLAUDE_CODE_OAUTH_TOKEN && process.env.ANTHROPIC_API_KEY) {
-    log("config:warning", { warning: "Beide Login-Arten gesetzt. Es wird nur CLAUDE_CODE_OAUTH_TOKEN an die Jobs gegeben." });
   }
   CONTAINER_UID = Number((await docker(["run", "--rm", "--entrypoint", "id", cfg.image, "-u"])).trim());
   FACTORY_LOGIN = (await gh(["api", "user", "--jq", ".login"])).trim();

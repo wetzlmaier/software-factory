@@ -4,7 +4,7 @@
   ],
   "label": "factory",
   "maxParallel": 2,
-  "model": "opus",
+  "model": "inherit",
   "workflow": "starter-kit",
   "pollSeconds": 60,
   "jobTimeoutMinutes": 90,

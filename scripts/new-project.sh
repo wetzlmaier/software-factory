@@ -33,5 +33,5 @@ echo
 echo "Fertig: $(pwd)"
 echo "Nächste Schritte:"
 echo "  1. Briefing in docs/briefing.md legen"
-echo "  2. Claude Code hier starten und /init ausführen"
+echo "  2. Antigravity (agy) hier starten und /init ausführen"
 echo "  3. Pro Feature: /write-spec PROJ-X, dann /to-factory PROJ-X"
